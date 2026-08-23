@@ -1,0 +1,32 @@
+services:
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+
+    container_name: mycab-server
+
+    networks:
+      - mycab-network
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+
+    container_name: mycab-client
+
+    depends_on:
+      - server
+
+    stdin_open: true
+    tty: true
+
+    networks:
+      - mycab-network
+
+networks:
+
+  mycab-network:
+    driver: bridge

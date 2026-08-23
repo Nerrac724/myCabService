@@ -1,0 +1,10 @@
+FROM eclipse-temurin:17-jdk
+
+WORKDIR /app
+
+COPY common ./common
+COPY client ./client
+
+RUN javac -d out common/myCabInterface.java common/Ride.java client/myCabClient.java
+
+CMD ["java", "-cp", "out", "client.myCabClient"]
