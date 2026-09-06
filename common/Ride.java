@@ -22,6 +22,10 @@ public class Ride implements Serializable {
 
     private Map<String, Long> acceptances = new HashMap<>();
 
+    private Map<String, Long> acceptanceLamportClocks = new HashMap<>();
+    private Map<String, Long> arrivalLamportClocks = new HashMap<>();
+    private long assignmentLamportClock;
+
     public Ride(int rideId, String customer, String pickup, String destination) {
         this.rideId = rideId;
         this.customer = customer;
@@ -32,8 +36,6 @@ public class Ride implements Serializable {
 
         this.requestTime = System.currentTimeMillis();
     }
-
-    // Getters
 
     public int getRideId() {
         return rideId;
@@ -75,7 +77,17 @@ public class Ride implements Serializable {
         return acceptances;
     }
 
-    // Setters
+    public Map<String, Long> getAcceptanceLamportClocks() {
+        return acceptanceLamportClocks;
+    }
+
+    public Map<String, Long> getArrivalLamportClocks() {
+        return arrivalLamportClocks;
+    }
+
+    public long getAssignmentLamportClock() {
+        return assignmentLamportClock;
+    }
 
     public void setStatus(String status) {
         this.status = status;
@@ -89,12 +101,21 @@ public class Ride implements Serializable {
         this.assignmentTime = assignmentTime;
     }
 
+    public void setAssignmentLamportClock(long assignmentLamportClock) {
+        this.assignmentLamportClock = assignmentLamportClock;
+    }
+
     public void setDeadline(long deadline) {
         this.deadline = deadline;
     }
 
-    public void addAcceptance(String driverId, long timestamp) {
+    public void addAcceptance(String driverId, long timestamp, long lamportClock) {
         acceptances.put(driverId, timestamp);
+        acceptanceLamportClocks.put(driverId, lamportClock);
+    }
+
+    public void addArrivalLamportClock(String driverId, long lamportClock) {
+        arrivalLamportClocks.put(driverId, lamportClock);
     }
 
     @Override
@@ -106,11 +127,13 @@ public class Ride implements Serializable {
                 + "\nStatus: " + status
                 + "\nAssigned Driver: "
                 + assignedDriver
-                + "\nRequest Time: "
+                + "\nRequest Time (physical): "
                 + requestTime
-                + "\nAssignment Time: "
+                + "\nAssignment Time (physical): "
                 + assignmentTime
-                + "\nDeadline: "
+                + "\nAssignment Lamport Clock: "
+                + assignmentLamportClock
+                + "\nDeadline (physical): "
                 + deadline;
     }
 }
