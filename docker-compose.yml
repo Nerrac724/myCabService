@@ -1,12 +1,76 @@
 services:
 
-  server:
+  mysql1:
+    image: mysql:8.0
+    container_name: mycab-mysql1
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: mycab
+      MYSQL_USER: mycab_user
+      MYSQL_PASSWORD: mycab_password
+    ports:
+      - "3307:3306"
+    volumes:
+      - mycab_mysql1_data:/var/lib/mysql
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - mycab-network
+
+  mysql2:
+    image: mysql:8.0
+    container_name: mycab-mysql2
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: mycab
+      MYSQL_USER: mycab_user
+      MYSQL_PASSWORD: mycab_password
+    ports:
+      - "3308:3306"
+    volumes:
+      - mycab_mysql2_data:/var/lib/mysql
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - mycab-network
+
+  server1:
     build:
       context: .
       dockerfile: Dockerfile.server
+    depends_on:
+      mysql1:
+        condition: service_healthy
+    environment:
+      DB_HOST: mysql1
+      DB_PORT: "3306"
+      PEER_SERVER_HOST: server2
+    container_name: mycab-server1
+    networks:
+      - mycab-network
 
-    container_name: mycab-server
-
+  server2:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    depends_on:
+      mysql2:
+        condition: service_healthy
+    environment:
+      DB_HOST: mysql2
+      DB_PORT: "3306"
+      PEER_SERVER_HOST: server1
+    container_name: mycab-server2
     networks:
       - mycab-network
 
@@ -14,15 +78,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.client
-
     container_name: mycab-client
-
     depends_on:
-      - server
-
+      - server1
+      - server2
     stdin_open: true
     tty: true
-
     networks:
       - mycab-network
 
@@ -30,3 +91,8 @@ networks:
 
   mycab-network:
     driver: bridge
+
+volumes:
+
+  mycab_mysql1_data:
+  mycab_mysql2_data:
