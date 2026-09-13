@@ -4,9 +4,10 @@ WORKDIR /app
 
 COPY common ./common
 COPY server ./server
+COPY lib ./lib
 
-RUN javac -d out common/myCabInterface.java common/Ride.java server/myCabServer.java
+RUN javac -cp "lib/mysql-connector-j.jar" -d out common/myCabInterface.java common/Ride.java server/myCabServer.java server/DatabaseManager.java
 
 EXPOSE 1099
 
-CMD ["java", "-cp", "out", "server.myCabServer"]
+CMD ["java", "-cp", "out:lib/mysql-connector-j.jar", "server.myCabServer"]

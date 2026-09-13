@@ -1,164 +1,155 @@
 # MyCabService 🚕
 
-A distributed Cab Booking and Management System built with **Java RMI (Remote Method Invocation)** and containerized using **Docker** and **Docker Compose**.
-
-The system enables ride requests, dual-layer timestamping for driver acceptances — a **physical clock** (Cristian's algorithm, synchronized automatically on startup) and a **Lamport logical clock** (causal ordering) — first-valid acceptance finalization, driver pickup tracking, and real-time status monitoring.
+A distributed cab booking and management system built with **Java RMI**, backed by a **MySQL primary/backup pair**, and containerized with **Docker Compose**. The project demonstrates two distinct distributed-systems experiments on top of the same ride-booking domain: a **timing and consistency model** (physical + logical clocks) and a **fault tolerance model** (automatic database failover and failback).
 
 ---
 
 ## 🏗 System Architecture
 
-The project consists of three main Java components:
-- **`common/`**: Shared interfaces (`myCabInterface.java`) and data models (`Ride.java`).
-- **`server/`**: RMI server implementation (`myCabServer.java`) managing rides, acceptances, physical/logical clock state, and driver assignments.
-- **`client/`**: Interactive command-line client (`myCabClient.java`) that connects to a specified RMI server.
-
----
-
-## ⚡ Features
-
-1. **Cab Request**: Ride requests can be created specifying customer, pickup, and destination.
-2. **Physical Clock Synchronization**: Runs automatically on client startup using Cristian's algorithm — five round-trip samples are taken and the offset from the lowest-RTT sample is adopted. Can also be re-triggered manually from the menu.
-3. **Lamport Logical Clock**: Both client and server maintain an independent logical clock, incremented on every send and updated via the max-plus-one rule on every receive. Printed alongside each action for traceability.
-4. **Driver Acceptance**: Multiple drivers can accept a ride request, each acceptance recorded with both a physical timestamp and a Lamport clock value.
-5. **Ride Finalization & Winner Determination**: The ride is assigned to the driver with the earliest physical timestamp (authoritative). The Lamport-order winner is computed and logged alongside it for comparison — a mismatch between the two indicates clock skew between drivers.
-6. **Pickup Arrival & Deadline Tracking**: Tracks driver arrival against a 10-minute physical-clock deadline and reassigns the ride if the driver is late. Arrival Lamport values are recorded for reference.
-7. **Multi-Instance Support**: Server and client each accept an optional startup argument, allowing multiple independent server/client pairs to run side by side (e.g. for local or Dockerized multi-instance testing).
-
----
-
-## 📁 Repository Structure
-
 ```text
 MyCabProject/
-├── client/
-│   └── myCabClient.java      # CLI Client application
 ├── common/
-│   ├── myCabInterface.java   # Remote RMI Interface
-│   └── Ride.java             # Ride data structure
+│   ├── myCabInterface.java   # Remote RMI interface
+│   └── Ride.java             # Shared ride data model
 ├── server/
-│   └── myCabServer.java      # RMI Server implementation
-├── Dockerfile.client         # Dockerfile for Client
-├── Dockerfile.server         # Dockerfile for Server
-├── docker-compose.yml        # Docker Compose configuration
-└── README.md                 # Project documentation
+│   ├── myCabServer.java      # RMI server implementation
+│   └── DatabaseManager.java  # Primary/backup DB connection + failover logic
+├── client/
+│   └── myCabClient.java      # Interactive CLI client
+├── db/
+│   └── init.sql              # Schema: rides, acceptances, arrivals
+├── lib/
+│   └── mysql-connector-j.jar # JDBC driver (downloaded separately, see below)
+├── Dockerfile.server
+├── Dockerfile.client
+├── docker-compose.yml
+└── README.md
 ```
+
+**Services in `docker-compose.yml`:**
+- `mysql-primary`, `mysql-backup` — two independent MySQL instances sharing the same schema
+- `server1`, `server2` — two RMI server instances, both connected to the *same* primary/backup database pair
+- `client` — interactive CLI, connects to `server1` by default
+
+Both server instances read/write through the same database pair rather than owning separate databases — data consistency here is about keeping one logical dataset correct and available, not about reconciling divergent copies.
 
 ---
 
-## 🚀 Getting Started with Docker (Recommended)
+## ⚡ Experiment 1: Timing and Consistency
+
+**Where it lives:** `myCabClient.java` (client-side clock logic) and `myCabServer.java` (server-side clock logic + `finalizeRide`).
+
+**Physical clock — Cristian's Algorithm** (`synchronizeClock` in the client): runs automatically the moment a client connects, before the menu appears. It takes five round-trip samples against `getServerTime()`, computes an offset for each, and adopts the offset from whichever sample had the lowest round-trip time (least network uncertainty). This offset is applied to every subsequent client-side timestamp sent to the server (`System.currentTimeMillis() + clockOffset`), so acceptance and arrival times are comparable across clients even if their local clocks differ slightly.
+
+**Lamport logical clock** (`tick()` / `syncLamportWithServer()` on the client, `updateLamportClock()` / `tickLamportClock()` on the server): both sides maintain an independent counter. Every RMI call increments the sender's clock before sending (`tick()`), and the receiver applies `max(local, received) + 1` on arrival. After the call returns, the client also pulls the server's current clock (`getServerLamportClock()`) and applies the same receive-rule to itself, since a normal RMI return value has no room to carry a clock value back.
+
+**Where the two are compared:** `finalizeRide` on the server computes the ride winner twice — once by earliest physical timestamp (the actual, authoritative decision) and once by earliest Lamport clock (logged only). It explicitly prints whether the two agree or disagree; a disagreement indicates clock skew between the competing drivers' clients.
+
+### Demonstration steps
+
+1. Bring up the stack (see **Running the Project** below) and open a client:
+   ```
+   docker compose run --rm client
+   ```
+2. Observe the automatic physical clock sync on startup — five samples, adopted offset, printed before the menu appears.
+3. Option 1 — request a cab, note the Ride ID. Observe the Lamport clock printed before and after the call.
+4. Option 3 — accept the ride as one driver (e.g. driver `A`). Note the physical timestamp and Lamport clock recorded.
+5. Open a second client session and accept the same ride as a different driver (e.g. driver `B`), ideally with a short delay so the two acceptances land close together in time.
+6. Option 4 — finalize the ride. The server output shows both drivers' physical and Lamport values side by side, states the winner by each method, and explicitly reports whether they **AGREE** or **DISAGREE**.
+7. To intentionally produce a disagreement for the report: run one client under `faketime` (or otherwise skew its clock) so its physical timestamp lags or leads while its Lamport clock still reflects normal message ordering — this reliably produces the `DISAGREE` case.
+
+---
+
+## 🛡 Experiment 2: Fault Tolerance (Primary/Backup Failover)
+
+**Where it lives:** `DatabaseManager.java`.
+
+Each server holds two live JDBC connections — one to `mysql-primary`, one to `mysql-backup`. All reads and writes go through whichever database is currently marked active (primary, by default). Every write is also best-effort mirrored to the *inactive* side, so the backup stays caught up in near real time without relying on MySQL's own replication features.
+
+**Failover:** if the active connection is found to be dead (`isAlive()` fails), the manager attempts one reconnect; if that also fails, it logs `FAILOVER` and switches to the backup for all subsequent operations.
+
+**Failback:** while running on backup, the manager retries the primary on a throttled interval (every 5 seconds). Once the primary responds again, it logs `FAILBACK` and switches back — and because mirroring always targets whichever side is currently inactive, the primary is automatically caught up on everything written during the outage before or as failback occurs.
+
+**Visible proof point:** `getRideInstance` (client option 6) always reports `Currently serving from: PRIMARY` or `BACKUP`, so the active database is visible in every status check without needing to read server logs.
+
+### Demonstration steps
+
+1. Bring up the stack and confirm both databases are healthy:
+   ```
+   docker compose up -d --build
+   docker compose ps
+   ```
+2. Create a ride:
+   ```
+   docker compose run --rm client
+   ```
+   Option 1, note the Ride ID.
+3. Confirm the write was mirrored to both databases:
+   ```
+   docker compose exec mysql-primary mysql -u root -prootpassword -e "USE mycab; SELECT * FROM rides;"
+   docker compose exec mysql-backup mysql -u root -prootpassword -e "USE mycab; SELECT * FROM rides;"
+   ```
+   Both should show the identical row — this is the baseline proof that replication is live *before* any failure is introduced.
+4. Simulate a primary outage:
+   ```
+   docker compose stop mysql-primary
+   ```
+5. Tail the server logs in a separate terminal:
+   ```
+   docker compose logs -f server1
+   ```
+6. Perform another action (e.g. option 6, Check Ride Status, same Ride ID). The logs show `FAILOVER: primary is down, switching to BACKUP.` and the client output ends with `Currently serving from: BACKUP`.
+7. Continue exercising writes while still on backup — option 3 (accept) and option 4 (finalize) with the same Ride ID — to show the system is fully operational, not just serving stale reads.
+8. Restore the primary:
+   ```
+   docker compose start mysql-primary
+   ```
+9. Wait at least 5 seconds (the failback retry interval), then perform another action. The logs show `FAILBACK: primary is back online, switching back to PRIMARY.` and the client output returns to `Currently serving from: PRIMARY`.
+10. Confirm the primary is caught up on everything written during the outage:
+    ```
+    docker compose exec mysql-primary mysql -u root -prootpassword -e "USE mycab; SELECT * FROM rides; SELECT * FROM acceptances;"
+    ```
+    The acceptance and assignment data from step 7 should be present — this is the proof that recovery didn't just restore connectivity, it restored data consistency.
+
+---
+
+## 🚀 Running the Project
 
 ### Prerequisites
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running.
+- Docker Desktop
+- `lib/mysql-connector-j.jar` present in the project root (if missing):
+  ```
+  mkdir lib
+  curl -L -o lib/mysql-connector-j.jar https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/8.3.0/mysql-connector-j-8.3.0.jar
+  ```
 
----
-
-### Step 1: Clone the Repository
-```bash
-git clone https://github.com/Nerrac724/myCabService.git
-cd myCabService
+### Start everything
 ```
-
-### Step 2: Build and Start the RMI Server
-```bash
-docker compose up --build -d server
+docker compose up -d --build
+docker compose ps
 ```
+All five services (`mysql-primary`, `mysql-backup`, `server1`, `server2`, `client`) should be listed; both databases should reach `healthy` before the servers start (enforced via `depends_on`).
 
-To view server logs in real time (including physical/Lamport clock activity):
-```bash
-docker compose logs -f server
+### Connect a client
 ```
-
-### Step 3: Run the Interactive Client CLI
-```bash
 docker compose run --rm client
 ```
-
-*The client connects to `rmi://server:1099/MyCabService` on the bridge network by default, and performs an automatic physical clock sync against it on startup before showing the menu.*
-
----
-
-### Step 4: Interactive Menu Options
-
-```text
-================================
- Connected to MyCab Server at server:1099
-================================
-
-====== PHYSICAL CLOCK SYNCHRONIZATION (Cristian's Algorithm) ======
-Sample 1: RTT=...ms, estimated offset=...ms
-...
-Adopted clock offset: ...ms
-Clock synchronized.
-=====================================================
-
-========== MY CAB MENU ==========
-1. Request Cab
-2. Synchronize Clock
-3. Driver Accept Ride
-4. Finalize Ride / Assign Driver
-5. Driver Arrives at Pickup
-6. Check Ride Status
-7. Exit
-=================================
-Enter your choice:
+Connects to `server1` by default (baked into the compose file's `command`). To target `server2` instead:
+```
+docker compose run --rm client java -cp out client.myCabClient server2:1099
 ```
 
-Each menu action that involves an RMI call (1, 3, 5) prints the Lamport clock value before sending and after the corresponding receive-event update, alongside the physical timestamp where relevant.
+### Inspect a database directly
+```
+docker compose exec mysql-primary mysql -u root -prootpassword -e "USE mycab; SHOW TABLES;"
+docker compose exec mysql-backup mysql -u root -prootpassword -e "USE mycab; SHOW TABLES;"
+```
 
----
-
-### Step 5: Stopping the Containers
-```bash
+### Stop everything
+```
 docker compose down
 ```
-
----
-
-## 🛠 Running Locally (Without Docker)
-
-### Prerequisites
-- Java Development Kit (JDK 17 or higher).
-
-### 1. Compile the Source Files
-From the project root directory (`MyCabProject/`):
-```bash
-javac -d out common/*.java server/*.java client/*.java
-```
-
-### 2. Start the RMI Server
-Optional first argument sets the registry port (defaults to `1099`):
-```bash
-java -cp out server.myCabServer 1099
-```
-
-### 3. Run the Client CLI
-Optional first argument sets the target `host:port` (defaults to `server:1099`):
-```bash
-java -cp out client.myCabClient localhost:1099
-```
-
----
-
-## 🔀 Running Multiple Server/Client Pairs
-
-The port and host arguments above allow independent server/client pairs to run side by side without interfering with one another — useful for demonstrating physical/Lamport clock behavior across genuinely separate processes.
-
-```bash
-# Terminal 1
-java -cp out server.myCabServer 1099
-
-# Terminal 2
-java -cp out server.myCabServer 1100
-
-# Terminal 3
-java -cp out client.myCabClient localhost:1099
-
-# Terminal 4
-java -cp out client.myCabClient localhost:1100
-```
-
-Each server maintains its own independent ride list and Lamport clock; each client independently syncs its own physical clock offset against whichever server it targets. The two pairs do not share state or communicate — this setup is for isolated timing demonstrations, not load balancing or failover, which are out of scope for this experiment.
+Database contents persist in named volumes (`mycab_mysql_primary_data`, `mycab_mysql_backup_data`) across restarts; add `-v` to also wipe them.
 
 ---
 

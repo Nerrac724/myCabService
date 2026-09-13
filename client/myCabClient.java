@@ -1,21 +1,26 @@
 package client;
 
 import common.myCabInterface;
-
 import java.rmi.Naming;
 import java.rmi.RemoteException;
 import java.util.Scanner;
 
 public class myCabClient {
 
+    // Physical clock offset (this client's local time -> server time)
     private static long clockOffset = 0;
 
+    // Lamport logical clock for this client
     private static long lamportClock = 0;
 
     public static void main(String[] args) {
 
         Scanner scanner = new Scanner(System.in);
+
+        // Optional first arg: "host:port" of the server to connect to.
+        // Defaults to "server:1099" for the existing Docker setup.
         String target = (args.length >= 1) ? args[0] : "server:1099";
+
         try {
             myCabInterface server = (myCabInterface) Naming.lookup("rmi://" + target + "/MyCabService");
 
@@ -23,6 +28,7 @@ public class myCabClient {
             System.out.println(" Connected to MyCab Server at " + target);
             System.out.println("================================");
 
+            // Physical clock system initializes automatically on startup
             synchronizeClock(server, true);
 
             int rideId = -1;
@@ -41,6 +47,7 @@ public class myCabClient {
                 System.out.println("7. Exit");
                 System.out.println("=================================");
                 System.out.print("Enter your choice: ");
+
                 int choice = scanner.nextInt();
                 scanner.nextLine();
 
@@ -65,29 +72,17 @@ public class myCabClient {
                         System.out.println("Cab requested successfully.");
                         System.out.println("Ride ID: " + rideId);
                         break;
-
                     case 2:
                         synchronizeClock(server, true);
                         break;
-
                     case 3:
-                        if (rideId == -1) {
-                            System.out.println("Please request a cab first.");
-                            break;
-                        }
                         System.out.println();
                         System.out.println("====== DRIVER ACCEPTANCE ======");
+                        System.out.print("Enter Ride ID: ");
+                        rideId = scanner.nextInt();
+                        scanner.nextLine();
                         System.out.print("Enter Driver ID: ");
                         String driverId = scanner.nextLine();
-                        System.out.print("Enter maximum acceptance delay in milliseconds: ");
-                        long maxDelay = scanner.nextLong();
-                        scanner.nextLine();
-                        long delay = (long) (Math.random() * maxDelay);
-                        System.out.println("Random acceptance delay generated: " + delay + " ms");
-                        if (delay > 0) {
-                            System.out.println("Driver " + driverId + " waiting " + delay + " ms...");
-                            Thread.sleep(delay);
-                        }
                         long synchronizedTimestamp = System.currentTimeMillis() + clockOffset;
                         System.out.println("Synchronized acceptance timestamp (physical): " + synchronizedTimestamp);
 
@@ -103,33 +98,26 @@ public class myCabClient {
                             System.out.println("Acceptance rejected.");
                         }
                         break;
-
                     case 4:
-                        if (rideId == -1) {
-                            System.out.println("Please request a cab first.");
-                            break;
-                        }
                         System.out.println();
                         System.out.println("====== FINALIZE RIDE ======");
+                        System.out.print("Enter Ride ID: ");
+                        rideId = scanner.nextInt();
+                        scanner.nextLine();
                         String result = server.finalizeRide(rideId);
                         syncLamportWithServer(server);
                         System.out.println(result);
                         System.out.println("Lamport clock (after receive): " + lamportClock);
                         break;
-
                     case 5:
-                        if (rideId == -1) {
-                            System.out.println("Please request a cab first.");
-                            break;
-                        }
                         System.out.println();
                         System.out.println("====== DRIVER ARRIVAL ======");
+                        System.out.print("Enter Ride ID: ");
+                        rideId = scanner.nextInt();
+                        scanner.nextLine();
                         System.out.print("Enter Driver ID: ");
                         String arrivalDriver = scanner.nextLine();
-                        System.out.print("Enter maximum arrival delay in milliseconds: ");
-                        long maxArrivalDelay = scanner.nextLong();
-                        scanner.nextLine();
-                        long arrivalDelay = (long) (Math.random() * maxArrivalDelay);
+                        long arrivalDelay = (long) (Math.random() * 100);
                         System.out.println("Random arrival delay generated: " + arrivalDelay + " ms");
                         if (arrivalDelay > 0) {
                             System.out.println("Simulating driver travel for " + arrivalDelay + " ms...");
@@ -137,34 +125,32 @@ public class myCabClient {
                         }
                         long arrivalTimestamp = System.currentTimeMillis() + clockOffset;
                         System.out.println("Arrival timestamp (physical): " + arrivalTimestamp);
+
                         tick();
                         System.out.println("Lamport clock (send): " + lamportClock);
                         boolean onTime = server.arriveAtPickup(rideId, arrivalDriver, arrivalTimestamp, lamportClock);
                         syncLamportWithServer(server);
                         System.out.println("Lamport clock (after receive): " + lamportClock);
+
                         if (onTime) {
                             System.out.println("Driver arrived on time.");
                         } else {
                             System.out.println("Driver was late or arrival was rejected.");
                         }
                         break;
-
                     case 6:
-                        if (rideId == -1) {
-                            System.out.println("No ride has been created yet.");
-                            break;
-                        }
                         System.out.println();
                         System.out.println("====== RIDE STATUS ======");
+                        System.out.print("Enter Ride ID: ");
+                        rideId = scanner.nextInt();
+                        scanner.nextLine();
                         System.out.println(server.getRideInstance(rideId));
                         break;
-
                     case 7:
                         System.out.println();
                         System.out.println("Exiting MyCab Client...");
                         running = false;
                         break;
-
                     default:
                         System.out.println("Invalid choice.");
                         System.out.println("Please enter a number between 1 and 7.");
@@ -178,6 +164,12 @@ public class myCabClient {
         }
     }
 
+    /**
+     * Physical clock synchronization using Cristian's algorithm. Takes several
+     * round-trip samples and adopts the offset from the sample with the
+     * smallest round-trip time (least uncertainty), rather than trusting a
+     * single noisy measurement.
+     */
     private static void synchronizeClock(myCabInterface server, boolean verbose) throws RemoteException {
         int samples = 5;
         long bestRtt = Long.MAX_VALUE;
@@ -216,10 +208,13 @@ public class myCabClient {
         }
     }
 
+    // Local-event / send-event rule: clock = clock + 1
     private static long tick() {
         return ++lamportClock;
     }
 
+    // Receive-event rule, applied after an RMI call returns:
+    // clock = max(local, server's clock) + 1
     private static void syncLamportWithServer(myCabInterface server) throws RemoteException {
         long serverClock = server.getServerLamportClock();
         lamportClock = Math.max(lamportClock, serverClock) + 1;

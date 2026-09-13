@@ -1,8 +1,8 @@
 services:
 
-  mysql1:
+  mysql-primary:
     image: mysql:8.0
-    container_name: mycab-mysql1
+    container_name: mycab-mysql-primary
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: rootpassword
@@ -12,7 +12,7 @@ services:
     ports:
       - "3307:3306"
     volumes:
-      - mycab_mysql1_data:/var/lib/mysql
+      - mycab_mysql_primary_data:/var/lib/mysql
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
@@ -22,9 +22,9 @@ services:
     networks:
       - mycab-network
 
-  mysql2:
+  mysql-backup:
     image: mysql:8.0
-    container_name: mycab-mysql2
+    container_name: mycab-mysql-backup
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: rootpassword
@@ -34,7 +34,7 @@ services:
     ports:
       - "3308:3306"
     volumes:
-      - mycab_mysql2_data:/var/lib/mysql
+      - mycab_mysql_backup_data:/var/lib/mysql
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
@@ -49,12 +49,16 @@ services:
       context: .
       dockerfile: Dockerfile.server
     depends_on:
-      mysql1:
+      mysql-primary:
+        condition: service_healthy
+      mysql-backup:
         condition: service_healthy
     environment:
-      DB_HOST: mysql1
-      DB_PORT: "3306"
-      PEER_SERVER_HOST: server2
+      DB_PRIMARY_HOST: mysql-primary
+      DB_PRIMARY_PORT: "3306"
+      DB_BACKUP_HOST: mysql-backup
+      DB_BACKUP_PORT: "3306"
+      SERVER_HOSTNAME: server1
     container_name: mycab-server1
     networks:
       - mycab-network
@@ -64,12 +68,16 @@ services:
       context: .
       dockerfile: Dockerfile.server
     depends_on:
-      mysql2:
+      mysql-primary:
+        condition: service_healthy
+      mysql-backup:
         condition: service_healthy
     environment:
-      DB_HOST: mysql2
-      DB_PORT: "3306"
-      PEER_SERVER_HOST: server1
+      DB_PRIMARY_HOST: mysql-primary
+      DB_PRIMARY_PORT: "3306"
+      DB_BACKUP_HOST: mysql-backup
+      DB_BACKUP_PORT: "3306"
+      SERVER_HOSTNAME: server2
     container_name: mycab-server2
     networks:
       - mycab-network
@@ -79,6 +87,7 @@ services:
       context: .
       dockerfile: Dockerfile.client
     container_name: mycab-client
+    command: ["java", "-cp", "out", "client.myCabClient", "server1:1099"]
     depends_on:
       - server1
       - server2
@@ -94,5 +103,5 @@ networks:
 
 volumes:
 
-  mycab_mysql1_data:
-  mycab_mysql2_data:
+  mycab_mysql_primary_data:
+  mycab_mysql_backup_data:
