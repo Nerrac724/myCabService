@@ -5,6 +5,6 @@ WORKDIR /app
 COPY common ./common
 COPY client ./client
 
-RUN javac -d out common/myCabInterface.java common/Ride.java client/myCabClient.java
+RUN javac -d out common/*.java client/*.java
 
-CMD ["java", "-cp", "out", "client.myCabClient"]
+CMD ["java", "-cp", "out", "client.myCabClient", "server1:1099"]

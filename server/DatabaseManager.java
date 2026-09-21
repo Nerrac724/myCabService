@@ -1,5 +1,6 @@
 package server;
 
+import common.TimeUtil;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -10,11 +11,11 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * Connects to a shared PRIMARY MySQL instance for all reads/writes.
- * Every write is also best-effort mirrored to a BACKUP instance so it stays
- * caught up. If the primary becomes unreachable, this manager automatically
- * fails over to the backup for both reads and writes for the rest of the
- * server's lifetime (does not fail back automatically).
+ * Connects to a shared PRIMARY MySQL instance for all reads/writes. Every write
+ * is also best-effort mirrored to a BACKUP instance so it stays caught up. If
+ * the primary becomes unreachable, this manager automatically fails over to the
+ * backup for both reads and writes for the rest of the server's lifetime (does
+ * not fail back automatically).
  */
 public class DatabaseManager {
 
@@ -72,9 +73,6 @@ public class DatabaseManager {
         }
     }
 
-    // Returns whichever database should serve this operation right now.
-    // While on backup, periodically (throttled) attempts to reconnect to
-    // primary and fails back automatically once it responds again.
     private synchronized Connection getActiveConnection() {
         if (usingBackup) {
             long now = System.currentTimeMillis();
@@ -110,9 +108,6 @@ public class DatabaseManager {
         return backupConnection;
     }
 
-    // Best-effort mirror of a write onto whichever database ISN'T currently
-    // active, so it's caught up if failover happens later. Never throws —
-    // a failed mirror must never fail the actual operation.
     private void mirrorWrite(String sql, Object... params) {
         Connection target = usingBackup ? primaryConnection : backupConnection;
         if (!isAlive(target)) {
@@ -147,9 +142,8 @@ public class DatabaseManager {
             throw new RuntimeException("Failed to insert ride", e);
         }
 
-        // Mirror with the SAME ride_id so both databases agree on identity
         mirrorWrite("INSERT INTO rides (ride_id, customer, pickup, destination, status, request_time) "
-                        + "VALUES (?, ?, ?, ?, 'WAITING', ?)",
+                + "VALUES (?, ?, ?, ?, 'WAITING', ?)",
                 rideId, customer, pickup, destination, requestTime);
 
         return rideId;
@@ -218,7 +212,7 @@ public class DatabaseManager {
     }
 
     public synchronized void assignRide(int rideId, String driverId, long assignmentTime,
-                                         long assignmentLamportClock, long deadline) {
+            long assignmentLamportClock, long deadline) {
         String sql = "UPDATE rides SET assigned_driver = ?, assignment_time = ?, assignment_lamport_clock = ?, "
                 + "deadline = ?, status = 'ASSIGNED' WHERE ride_id = ?";
         try (PreparedStatement ps = getActiveConnection().prepareStatement(sql)) {
@@ -314,10 +308,10 @@ public class DatabaseManager {
                         + "\nDestination: " + rs.getString("destination")
                         + "\nStatus: " + rs.getString("status")
                         + "\nAssigned Driver: " + rs.getString("assigned_driver")
-                        + "\nRequest Time (physical): " + rs.getLong("request_time")
-                        + "\nAssignment Time (physical): " + rs.getLong("assignment_time")
+                        + "\nRequest Time (physical): " + TimeUtil.formatTime(rs.getLong("request_time"))
+                        + "\nAssignment Time (physical): " + TimeUtil.formatTime(rs.getLong("assignment_time"))
                         + "\nAssignment Lamport Clock: " + rs.getLong("assignment_lamport_clock")
-                        + "\nDeadline (physical): " + rs.getLong("deadline")
+                        + "\nDeadline (physical): " + TimeUtil.formatTime(rs.getLong("deadline"))
                         + "\nCurrently serving from: " + (usingBackup ? "BACKUP" : "PRIMARY");
             }
         } catch (SQLException e) {

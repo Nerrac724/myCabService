@@ -1,5 +1,6 @@
 package server;
 
+import common.TimeUtil;
 import common.myCabInterface;
 import java.rmi.Naming;
 import java.rmi.RemoteException;
@@ -43,7 +44,7 @@ public class myCabServer extends UnicastRemoteObject implements myCabInterface {
         System.out.println("Customer: " + customer);
         System.out.println("Pickup: " + pickup);
         System.out.println("Destination: " + destination);
-        System.out.println("Request timestamp (physical): " + requestTime);
+        System.out.println("Request timestamp (physical): " + TimeUtil.formatTime(requestTime));
         System.out.println("Server Lamport clock: " + newClock);
         return rideId;
     }
@@ -75,7 +76,7 @@ public class myCabServer extends UnicastRemoteObject implements myCabInterface {
         db.addAcceptance(rideId, driverId, synchronizedTimestamp, newClock);
 
         System.out.println("[ACCEPTANCE] Driver " + driverId + " accepted Ride " + rideId
-                + " | physical time=" + synchronizedTimestamp
+                + " | physical time=" + TimeUtil.formatTime(synchronizedTimestamp)
                 + " | server Lamport clock=" + newClock);
         return true;
     }
@@ -125,12 +126,12 @@ public class myCabServer extends UnicastRemoteObject implements myCabInterface {
         for (Map.Entry<String, Long> entry : acceptances.entrySet()) {
             String d = entry.getKey();
             System.out.println("Driver " + d
-                    + " | physical=" + entry.getValue()
+                    + " | physical=" + TimeUtil.formatTime(entry.getValue())
                     + " | lamport=" + acceptanceLamportClocks.get(d));
         }
         System.out.println();
         System.out.println("WINNER BY PHYSICAL CLOCK (authoritative): " + physicalWinner
-                + " (t=" + earliestTimestamp + ")");
+                + " (t=" + TimeUtil.formatTime(earliestTimestamp) + ")");
         System.out.println("WINNER BY LAMPORT CLOCK (causal order):   " + lamportWinner
                 + " (L=" + earliestLamport + ")");
         if (!physicalWinner.equals(lamportWinner)) {
@@ -138,9 +139,9 @@ public class myCabServer extends UnicastRemoteObject implements myCabInterface {
         } else {
             System.out.println("Physical and Lamport orderings AGREE.");
         }
-        System.out.println("Assignment timestamp (physical): " + assignmentTime);
+        System.out.println("Assignment timestamp (physical): " + TimeUtil.formatTime(assignmentTime));
         System.out.println("Assignment Lamport clock: " + newClock);
-        System.out.println("10-minute deadline (physical): " + deadline);
+        System.out.println("10-minute deadline (physical): " + TimeUtil.formatTime(deadline));
         return "Ride " + rideId + " assigned to Driver " + physicalWinner;
     }
 
@@ -157,12 +158,12 @@ public class myCabServer extends UnicastRemoteObject implements myCabInterface {
         System.out.println();
         System.out.println("========== ARRIVAL DEADLINE CHECK ==========");
         System.out.println("Driver: " + driverId);
-        System.out.println("Arrival timestamp (physical): " + synchronizedTimestamp);
+        System.out.println("Arrival timestamp (physical): " + TimeUtil.formatTime(synchronizedTimestamp));
         System.out.println("Arrival Lamport clock: " + newClock);
 
         String assignedDriver = db.getAssignedDriver(rideId);
         long deadline = db.getDeadline(rideId);
-        System.out.println("Deadline (physical): " + deadline);
+        System.out.println("Deadline (physical): " + TimeUtil.formatTime(deadline));
 
         if (!driverId.equals(assignedDriver)) {
             System.out.println("Driver is not assigned to this ride.");

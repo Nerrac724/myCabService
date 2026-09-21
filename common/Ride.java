@@ -128,12 +128,12 @@ public class Ride implements Serializable {
                 + "\nAssigned Driver: "
                 + assignedDriver
                 + "\nRequest Time (physical): "
-                + requestTime
+                + common.TimeUtil.formatTime(requestTime)
                 + "\nAssignment Time (physical): "
-                + assignmentTime
+                + common.TimeUtil.formatTime(assignmentTime)
                 + "\nAssignment Lamport Clock: "
                 + assignmentLamportClock
                 + "\nDeadline (physical): "
-                + deadline;
+                + common.TimeUtil.formatTime(deadline);
     }
 }

@@ -6,7 +6,7 @@ COPY common ./common
 COPY server ./server
 COPY lib ./lib
 
-RUN javac -cp "lib/mysql-connector-j.jar" -d out common/myCabInterface.java common/Ride.java server/myCabServer.java server/DatabaseManager.java
+RUN javac -cp "lib/mysql-connector-j.jar" -d out common/*.java server/*.java
 
 EXPOSE 1099
 
