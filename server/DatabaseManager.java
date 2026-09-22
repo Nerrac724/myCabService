@@ -65,6 +65,80 @@ public class DatabaseManager {
         }
     }
 
+    private void resyncFromBackup() {
+        if (!isAlive(backupConnection) || !isAlive(primaryConnection)) {
+            return;
+        }
+        System.out.println("[DB] Reconciling PRIMARY with BACKUP after outage...");
+        try {
+            try (Statement st = backupConnection.createStatement(); ResultSet rs = st.executeQuery("SELECT * FROM rides")) {
+                while (rs.next()) {
+                    try (PreparedStatement ps = primaryConnection.prepareStatement(
+                            "INSERT INTO rides (ride_id, customer, pickup, destination, status, assigned_driver, "
+                            + "request_time, assignment_time, assignment_lamport_clock, deadline) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                            + "ON DUPLICATE KEY UPDATE status=VALUES(status), assigned_driver=VALUES(assigned_driver), "
+                            + "assignment_time=VALUES(assignment_time), assignment_lamport_clock=VALUES(assignment_lamport_clock), "
+                            + "deadline=VALUES(deadline)")) {
+                        ps.setInt(1, rs.getInt("ride_id"));
+                        ps.setString(2, rs.getString("customer"));
+                        ps.setString(3, rs.getString("pickup"));
+                        ps.setString(4, rs.getString("destination"));
+                        ps.setString(5, rs.getString("status"));
+                        ps.setString(6, rs.getString("assigned_driver"));
+                        ps.setLong(7, rs.getLong("request_time"));
+                        ps.setLong(8, rs.getLong("assignment_time"));
+                        ps.setLong(9, rs.getLong("assignment_lamport_clock"));
+                        ps.setLong(10, rs.getLong("deadline"));
+                        ps.executeUpdate();
+                    }
+                }
+            }
+
+            try (Statement st = backupConnection.createStatement(); ResultSet rs = st.executeQuery("SELECT * FROM acceptances")) {
+                while (rs.next()) {
+                    try (PreparedStatement ps = primaryConnection.prepareStatement(
+                            "INSERT INTO acceptances (ride_id, driver_id, physical_timestamp, lamport_clock) "
+                            + "VALUES (?, ?, ?, ?) "
+                            + "ON DUPLICATE KEY UPDATE physical_timestamp=VALUES(physical_timestamp), lamport_clock=VALUES(lamport_clock)")) {
+                        ps.setInt(1, rs.getInt("ride_id"));
+                        ps.setString(2, rs.getString("driver_id"));
+                        ps.setLong(3, rs.getLong("physical_timestamp"));
+                        ps.setLong(4, rs.getLong("lamport_clock"));
+                        ps.executeUpdate();
+                    }
+                }
+            }
+
+            try (Statement st = backupConnection.createStatement(); ResultSet rs = st.executeQuery("SELECT ride_id, driver_id, lamport_clock FROM arrivals")) {
+                while (rs.next()) {
+                    try (PreparedStatement check = primaryConnection.prepareStatement(
+                            "SELECT COUNT(*) FROM arrivals WHERE ride_id = ? AND driver_id = ? AND lamport_clock = ?")) {
+                        check.setInt(1, rs.getInt("ride_id"));
+                        check.setString(2, rs.getString("driver_id"));
+                        check.setLong(3, rs.getLong("lamport_clock"));
+                        try (ResultSet exists = check.executeQuery()) {
+                            exists.next();
+                            if (exists.getInt(1) == 0) {
+                                try (PreparedStatement insert = primaryConnection.prepareStatement(
+                                        "INSERT INTO arrivals (ride_id, driver_id, lamport_clock) VALUES (?, ?, ?)")) {
+                                    insert.setInt(1, rs.getInt("ride_id"));
+                                    insert.setString(2, rs.getString("driver_id"));
+                                    insert.setLong(3, rs.getLong("lamport_clock"));
+                                    insert.executeUpdate();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            System.out.println("[DB] Reconciliation complete — PRIMARY caught up with BACKUP.");
+        } catch (SQLException e) {
+            System.out.println("[DB] WARNING: reconciliation failed: " + e.getMessage());
+        }
+    }
+
     private boolean isAlive(Connection c) {
         try {
             return c != null && !c.isClosed() && c.isValid(2);
@@ -81,6 +155,7 @@ public class DatabaseManager {
                 connectPrimary();
                 if (isAlive(primaryConnection)) {
                     System.out.println("[DB] FAILBACK: primary is back online, switching back to PRIMARY.");
+                    resyncFromBackup();
                     usingBackup = false;
                 }
             }

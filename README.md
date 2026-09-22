@@ -1,6 +1,6 @@
 # MyCabService 🚕
 
-A distributed cab booking and management system built with **Java RMI**, backed by a **MySQL primary/backup pair**, and containerized with **Docker Compose**. The project demonstrates two distinct distributed-systems experiments on top of the same ride-booking domain: a **timing and consistency model** (physical + logical clocks) and a **fault tolerance model** (automatic database failover and failback).
+A distributed cab booking and management system built with **Java RMI**, backed by a **MySQL primary/backup pair**, and containerized with **Docker Compose**. The project demonstrates three distinct distributed-systems experiments on top of the same ride-booking domain: a **timing and consistency model** (physical + logical clocks), a **database fault tolerance model** (automatic primary/backup failover, failback, and reconciliation), and a **client-side fault tolerance model** (automatic failover and failback between two RMI server instances).
 
 ---
 
@@ -10,12 +10,13 @@ A distributed cab booking and management system built with **Java RMI**, backed 
 MyCabProject/
 ├── common/
 │   ├── myCabInterface.java   # Remote RMI interface
-│   └── Ride.java             # Shared ride data model
+│   ├── Ride.java             # Shared ride data model (legacy; DB now holds ride state)
+│   └── TimeUtil.java         # Shared human-readable timestamp formatting
 ├── server/
 │   ├── myCabServer.java      # RMI server implementation
-│   └── DatabaseManager.java  # Primary/backup DB connection + failover logic
+│   └── DatabaseManager.java  # Primary/backup DB connection + failover/failback/reconciliation logic
 ├── client/
-│   └── myCabClient.java      # Interactive CLI client
+│   └── myCabClient.java      # Interactive CLI client with server failover/failback
 ├── db/
 │   └── init.sql              # Schema: rides, acceptances, arrivals
 ├── lib/
@@ -29,7 +30,7 @@ MyCabProject/
 **Services in `docker-compose.yml`:**
 - `mysql-primary`, `mysql-backup` — two independent MySQL instances sharing the same schema
 - `server1`, `server2` — two RMI server instances, both connected to the *same* primary/backup database pair
-- `client` — interactive CLI, connects to `server1` by default
+- `client` — interactive CLI, connects to `server1` by default, with automatic failover to `server2` if `server1` becomes unreachable
 
 Both server instances read/write through the same database pair rather than owning separate databases — data consistency here is about keeping one logical dataset correct and available, not about reconciling divergent copies.
 
@@ -37,7 +38,7 @@ Both server instances read/write through the same database pair rather than owni
 
 ## ⚡ Experiment 1: Timing and Consistency
 
-**Where it lives:** `myCabClient.java` (client-side clock logic) and `myCabServer.java` (server-side clock logic + `finalizeRide`).
+**Where it lives:** `myCabClient.java` (client-side clock logic), `myCabServer.java` (server-side clock logic + `finalizeRide`), `common/TimeUtil.java` (shared formatting).
 
 **Physical clock — Cristian's Algorithm** (`synchronizeClock` in the client): runs automatically the moment a client connects, before the menu appears. It takes five round-trip samples against `getServerTime()`, computes an offset for each, and adopts the offset from whichever sample had the lowest round-trip time (least network uncertainty). This offset is applied to every subsequent client-side timestamp sent to the server (`System.currentTimeMillis() + clockOffset`), so acceptance and arrival times are comparable across clients even if their local clocks differ slightly.
 
@@ -45,22 +46,24 @@ Both server instances read/write through the same database pair rather than owni
 
 **Where the two are compared:** `finalizeRide` on the server computes the ride winner twice — once by earliest physical timestamp (the actual, authoritative decision) and once by earliest Lamport clock (logged only). It explicitly prints whether the two agree or disagree; a disagreement indicates clock skew between the competing drivers' clients.
 
+**Human-readable timestamps:** all physical timestamps — Cristian's sample times, acceptance/arrival timestamps, assignment time, deadline — are formatted through `TimeUtil.formatTime()` as `yyyy-MM-dd HH:mm:ss.SSS` in the local system time zone, rather than printed as raw epoch milliseconds.
+
 ### Demonstration steps
 
 1. Bring up the stack (see **Running the Project** below) and open a client:
    ```
    docker compose run --rm client
    ```
-2. Observe the automatic physical clock sync on startup — five samples, adopted offset, printed before the menu appears.
+2. Observe the automatic physical clock sync on startup — five samples with readable server times, adopted offset, and a synchronized local time, all printed before the menu appears.
 3. Option 1 — request a cab, note the Ride ID. Observe the Lamport clock printed before and after the call.
-4. Option 3 — accept the ride as one driver (e.g. driver `A`). Note the physical timestamp and Lamport clock recorded.
+4. Option 3 — accept the ride as one driver (e.g. driver `A`). Note the readable physical timestamp and Lamport clock recorded.
 5. Open a second client session and accept the same ride as a different driver (e.g. driver `B`), ideally with a short delay so the two acceptances land close together in time.
 6. Option 4 — finalize the ride. The server output shows both drivers' physical and Lamport values side by side, states the winner by each method, and explicitly reports whether they **AGREE** or **DISAGREE**.
 7. To intentionally produce a disagreement for the report: run one client under `faketime` (or otherwise skew its clock) so its physical timestamp lags or leads while its Lamport clock still reflects normal message ordering — this reliably produces the `DISAGREE` case.
 
 ---
 
-## 🛡 Experiment 2: Fault Tolerance (Primary/Backup Failover)
+## 🛡 Experiment 2: Database Fault Tolerance (Primary/Backup Failover, Failback, and Reconciliation)
 
 **Where it lives:** `DatabaseManager.java`.
 
@@ -68,9 +71,9 @@ Each server holds two live JDBC connections — one to `mysql-primary`, one to `
 
 **Failover:** if the active connection is found to be dead (`isAlive()` fails), the manager attempts one reconnect; if that also fails, it logs `FAILOVER` and switches to the backup for all subsequent operations.
 
-**Failback:** while running on backup, the manager retries the primary on a throttled interval (every 5 seconds). Once the primary responds again, it logs `FAILBACK` and switches back — and because mirroring always targets whichever side is currently inactive, the primary is automatically caught up on everything written during the outage before or as failback occurs.
+**Failback with reconciliation:** while running on backup, the manager retries the primary on a throttled interval (every 5 seconds). Once the primary responds again, it runs `resyncFromBackup()` — which copies every row from `rides`, `acceptances`, and `arrivals` on the backup into the primary (via `INSERT ... ON DUPLICATE KEY UPDATE` for `rides`/`acceptances`, and an existence-check-then-insert for `arrivals`) — **before** switching the active side back to primary. This closes the gap left during the outage: mirroring alone only covers writes made *while* primary is reachable, so anything written on backup during the outage needs an explicit catch-up pass rather than relying on the next mirrored write to carry it over.
 
-**Visible proof point:** `getRideInstance` (client option 6) always reports `Currently serving from: PRIMARY` or `BACKUP`, so the active database is visible in every status check without needing to read server logs.
+**Visible proof point:** `getRideInstance` (client option 6) always reports `Currently serving from: PRIMARY` or `BACKUP`, so the active database is visible in every status check without needing to read server logs. Server logs also show `[DB] Reconciling PRIMARY with BACKUP after outage...` and `[DB] Reconciliation complete...` around every failback.
 
 ### Demonstration steps
 
@@ -99,17 +102,71 @@ Each server holds two live JDBC connections — one to `mysql-primary`, one to `
    docker compose logs -f server1
    ```
 6. Perform another action (e.g. option 6, Check Ride Status, same Ride ID). The logs show `FAILOVER: primary is down, switching to BACKUP.` and the client output ends with `Currently serving from: BACKUP`.
-7. Continue exercising writes while still on backup — option 3 (accept) and option 4 (finalize) with the same Ride ID — to show the system is fully operational, not just serving stale reads.
+7. Continue exercising writes while still on backup — option 3 (accept) and option 5 (driver arrival) with the same Ride ID — to show the system is fully operational, not just serving stale reads. This is the data that must survive the failback reconciliation.
 8. Restore the primary:
    ```
    docker compose start mysql-primary
    ```
-9. Wait at least 5 seconds (the failback retry interval), then perform another action. The logs show `FAILBACK: primary is back online, switching back to PRIMARY.` and the client output returns to `Currently serving from: PRIMARY`.
+9. Wait at least 5 seconds (the failback retry interval), then perform another action. The logs show:
+   ```
+   [DB] FAILBACK: primary is back online, switching back to PRIMARY.
+   [DB] Reconciling PRIMARY with BACKUP after outage...
+   [DB] Reconciliation complete — PRIMARY caught up with BACKUP.
+   ```
+   and the client output returns to `Currently serving from: PRIMARY`.
 10. Confirm the primary is caught up on everything written during the outage:
     ```
-    docker compose exec mysql-primary mysql -u root -prootpassword -e "USE mycab; SELECT * FROM rides; SELECT * FROM acceptances;"
+    docker compose exec mysql-primary mysql -u root -prootpassword -e "USE mycab; SELECT * FROM rides; SELECT * FROM acceptances; SELECT * FROM arrivals;"
     ```
-    The acceptance and assignment data from step 7 should be present — this is the proof that recovery didn't just restore connectivity, it restored data consistency.
+    The data written in step 7 should now be present on primary — this is the proof that recovery restored both connectivity *and* data consistency, not just one or the other.
+
+---
+
+## 🔁 Experiment 3: Client-Side Fault Tolerance (Server Failover/Failback)
+
+**Where it lives:** `myCabClient.java` — `KNOWN_SERVERS`, `connectToAnyServer()`, `attemptFailback()`, `callWithFailover()`.
+
+Independent of the database-level fault tolerance above, the client itself is resilient to a full RMI server going down. The client holds a list of known servers (`server1:1099`, `server2:1099`) and every RMI call is routed through `callWithFailover(...)`, which:
+
+1. First checks (throttled to once per 5 seconds) whether the preferred server (`server1`, index 0) has come back online, switching back to it if so — this is the client-side **failback**.
+2. Attempts the call against the currently active server.
+3. If the call fails with a `RemoteException`, logs the failure, tries the next known server in the list, and retries — this is the client-side **failover**.
+
+This works safely because both `server1` and `server2` share the same primary/backup database pair (Experiment 2) — a ride created via one server is immediately visible via the other, so switching which server a client talks to mid-session never loses or hides data.
+
+**Design note for later comparison:** the failback policy here is a fixed preference (always prefer `server1` if reachable), not a load-based decision — intentionally a naive baseline to contrast against a real load balancer in a later experiment.
+
+### Demonstration steps
+
+1. Bring up the stack and connect a client:
+   ```
+   docker compose up -d --build
+   docker compose run --rm client
+   ```
+   Confirms connection to `server1:1099` by default.
+2. Create a ride (option 1), note the Ride ID.
+3. Kill the server the client is connected to:
+   ```
+   docker compose stop server1
+   ```
+4. In the same client session, perform another action (option 6, same Ride ID). Expect:
+   ```
+   Call failed (...) — failing over to next server...
+   Connected to MyCab Server at server2:1099
+   ```
+   followed by the ride status printing successfully.
+5. Restore the first server:
+   ```
+   docker compose start server1
+   ```
+6. Wait at least 5 seconds, then perform another action. Expect:
+   ```
+   Failback: server1:1099 is back online, switching back.
+   ```
+7. Confirm the call actually landed on `server1` by checking its logs immediately after:
+   ```
+   docker compose logs server1
+   ```
 
 ---
 
@@ -128,22 +185,26 @@ Each server holds two live JDBC connections — one to `mysql-primary`, one to `
 docker compose up -d --build
 docker compose ps
 ```
-All five services (`mysql-primary`, `mysql-backup`, `server1`, `server2`, `client`) should be listed; both databases should reach `healthy` before the servers start (enforced via `depends_on`).
+All five services (`mysql-primary`, `mysql-backup`, `server1`, `server2`, `client`) should be listed; both databases should reach `healthy` before the servers start (enforced via `depends_on`). `client` is not started by `up` since it's interactive — see below.
 
 ### Connect a client
 ```
 docker compose run --rm client
 ```
-Connects to `server1` by default (baked into the compose file's `command`). To target `server2` instead:
+Connects to `server1` by default (baked into the compose file's `command`, and also the Dockerfile's own default). To target `server2` directly instead:
 ```
 docker compose run --rm client java -cp out client.myCabClient server2:1099
 ```
 
 ### Inspect a database directly
+
+Via CLI:
 ```
 docker compose exec mysql-primary mysql -u root -prootpassword -e "USE mycab; SHOW TABLES;"
 docker compose exec mysql-backup mysql -u root -prootpassword -e "USE mycab; SHOW TABLES;"
 ```
+
+Via MySQL Workbench: connect to `127.0.0.1:3307` for primary and `127.0.0.1:3308` for backup, user `mycab_user` / password `mycab_password`.
 
 ### Stop everything
 ```
@@ -169,9 +230,9 @@ This section explains, topic by topic, exactly *how* each distributed-systems co
 |-------|------|------|
 | Interface | `common/myCabInterface.java` | Declares all remotely callable methods (`requestCab`, `acceptRide`, `finalizeRide`, `arriveAtPickup`, `getRideInstance`, `getServerTime`, `getServerLamportClock`). Extends `java.rmi.Remote`; every method throws `RemoteException`. |
 | Server | `server/myCabServer.java` | Extends `UnicastRemoteObject` and implements `myCabInterface`. In `main()`, creates an RMI registry on port 1099 (`LocateRegistry.createRegistry(port)`) and binds the server instance under the name `MyCabService` (`Naming.rebind`). |
-| Client | `client/myCabClient.java` | Looks up the remote object with `Naming.lookup("rmi://<host>:1099/MyCabService")` and casts to `myCabInterface`. From then on, all calls like `server.requestCab(...)` are transparent RMI calls. |
+| Client | `client/myCabClient.java` | Looks up remote objects with `Naming.lookup("rmi://<host>:1099/MyCabService")` and casts to `myCabInterface`. Every RMI call is routed through `callWithFailover()` (see Experiment 3), which internally selects the live server before invoking. |
 
-**Key detail — hostname advertisement:** Inside Docker, each server container sets `java.rmi.server.hostname` to its compose service name (e.g., `server1`) via the `SERVER_HOSTNAME` environment variable. Without this, RMI would advertise the container's internal IP, which is unreachable from other containers by name.
+**Key detail — hostname advertisement:** Inside Docker, each server container sets `java.rmi.server.hostname` to its compose service name (e.g., `server1`) via the `SERVER_HOSTNAME` environment variable. Without this, RMI would advertise the container's internal IP or `localhost`, which is unreachable from other containers by name.
 
 ```java
 // myCabServer.java — main()
@@ -204,6 +265,7 @@ MyCab Server is ready.
 | Server endpoint | `myCabServer.getServerTime()` | Returns `System.currentTimeMillis()` — acts as the authoritative time source. |
 | Client sync | `myCabClient.synchronizeClock()` | Takes **5 round-trip samples**, calculates `RTT` and `offset` for each, and **adopts the offset from the sample with the lowest RTT** (least network jitter). |
 | Offset application | Every client timestamp | `System.currentTimeMillis() + clockOffset` — used in `acceptRide` and `arriveAtPickup`. |
+| Readable output | `common/TimeUtil.formatTime()` | Converts every physical millisecond timestamp into `yyyy-MM-dd HH:mm:ss.SSS` local time before printing. |
 
 ```java
 // myCabClient.java — synchronizeClock()
@@ -228,13 +290,14 @@ clockOffset = bestOffset;
 **What you see on startup:**
 ```
 ====== PHYSICAL CLOCK SYNCHRONIZATION (Cristian's Algorithm) ======
-Sample 1: RTT=15ms, estimated offset=2ms
-Sample 2: RTT=8ms, estimated offset=1ms
-Sample 3: RTT=12ms, estimated offset=2ms
-Sample 4: RTT=6ms, estimated offset=1ms
-Sample 5: RTT=9ms, estimated offset=1ms
+Sample 1 | Server time: 2026-09-21 14:32:07.481 | RTT: 15ms | Offset: 2ms
+Sample 2 | Server time: 2026-09-21 14:32:07.489 | RTT: 8ms | Offset: 1ms
+Sample 3 | Server time: 2026-09-21 14:32:07.498 | RTT: 12ms | Offset: 2ms
+Sample 4 | Server time: 2026-09-21 14:32:07.505 | RTT: 6ms | Offset: 1ms
+Sample 5 | Server time: 2026-09-21 14:32:07.512 | RTT: 9ms | Offset: 1ms
 Best sample RTT: 6ms
 Adopted clock offset: 1ms
+Synchronized local time: 2026-09-21 14:32:07.506
 Clock synchronized.
 =====================================================
 ```
@@ -324,15 +387,15 @@ if (!physicalWinner.equals(lamportWinner)) {
 **What you see (server log):**
 ```
 ========== DRIVER ACCEPTANCE COMPARISON ==========
-Driver A | physical=1695000001234 | lamport=6
-Driver B | physical=1695000001567 | lamport=4
+Driver A | physical=2026-09-21 14:33:21.234 | lamport=6
+Driver B | physical=2026-09-21 14:33:21.567 | lamport=4
 
-WINNER BY PHYSICAL CLOCK (authoritative): A (t=1695000001234)
+WINNER BY PHYSICAL CLOCK (authoritative): A (t=2026-09-21 14:33:21.234)
 WINNER BY LAMPORT CLOCK (causal order):   B (L=4)
 NOTE: Physical and Lamport orderings DISAGREE — likely clock skew between driver clients.
-Assignment timestamp (physical): 1695000002000
+Assignment timestamp (physical): 2026-09-21 14:33:22.000
 Assignment Lamport clock: 9
-10-minute deadline (physical): 1695000602000
+10-minute deadline (physical): 2026-09-21 14:43:22.000
 ```
 
 **Why they can disagree:** Lamport clocks only capture *causal* ordering (message dependencies), not real-time ordering. Driver B might have a lower Lamport value because it sent fewer messages overall, even though it accepted later in wall-clock time.
@@ -369,11 +432,13 @@ public synchronized int insertRide(...) {
 
 **Methods that mirror writes:** `insertRide`, `addAcceptance`, `assignRide`, `clearAssignment`, `setStatus`, `addArrivalLamport`.
 
+**Known limitation this mechanism alone does not solve:** `mirrorWrite` only covers the single write happening *right now*, and only reaches the currently inactive side. If that side is unreachable at write time (e.g. it's the failed primary), the mirror is silently skipped — by design, since a dead mirror target must never fail the real operation. This means writes made *while a database is down* never get mirrored to it. See Section 6 for how the gap is closed on recovery.
+
 ---
 
-### 6. Automatic Failover and Failback
+### 6. Automatic Failover, Failback, and Reconciliation
 
-**Concept:** If the active (primary) database becomes unreachable, the system automatically fails over to the backup. While on backup, it periodically retries the primary and fails back once it's healthy again.
+**Concept:** If the active (primary) database becomes unreachable, the system automatically fails over to the backup. While on backup, it periodically retries the primary; once it recovers, the system doesn't just resume using it — it first **reconciles** the primary with everything the backup accumulated during the outage, closing the gap that best-effort mirroring alone cannot cover (see Section 5).
 
 **How we implement it — `getActiveConnection()`:**
 
@@ -387,6 +452,7 @@ private synchronized Connection getActiveConnection() {
             connectPrimary();
             if (isAlive(primaryConnection)) {
                 System.out.println("[DB] FAILBACK: primary is back online, switching back to PRIMARY.");
+                resyncFromBackup();          // reconcile BEFORE switching the active side
                 usingBackup = false;
             }
         }
@@ -409,6 +475,8 @@ private synchronized Connection getActiveConnection() {
 }
 ```
 
+**Reconciliation — `resyncFromBackup()`:** Reads every row currently in the backup's `rides`, `acceptances`, and `arrivals` tables and upserts them into the primary (`INSERT ... ON DUPLICATE KEY UPDATE` for `rides`/`acceptances`; an explicit existence check followed by insert for `arrivals`, since that table has no natural unique key to upsert against). This runs synchronously as part of the failback path, so the active side is only flipped back to primary once it's confirmed caught up — a request arriving mid-reconciliation still sees the backup as active until the copy finishes.
+
 **Health check — `isAlive()`:**
 ```java
 private boolean isAlive(Connection c) {
@@ -430,11 +498,11 @@ private boolean isAlive(Connection c) {
                     │   unreachable   │
                     │                 │
                     └─────────────────┘
-                      primary recovered
-                      (every 5s retry)
+                 primary recovered + reconciled
+                     (retried every 5s)
 ```
 
-**Visible proof — `getRideAsString()`:** Every status check appends `Currently serving from: PRIMARY` or `Currently serving from: BACKUP`, so you can confirm the active database without reading server logs.
+**Visible proof — `getRideAsString()`:** Every status check appends `Currently serving from: PRIMARY` or `Currently serving from: BACKUP`, so you can confirm the active database without reading server logs. Server logs additionally show the reconciliation happening around every failback.
 
 ---
 
@@ -474,9 +542,9 @@ if (synchronizedTimestamp <= deadline) {
 |---------|-------------------|-------------------|
 | `mysql-primary` | `mysql:8.0` | Port 3307→3306, named volume, health check via `mysqladmin ping` |
 | `mysql-backup` | `mysql:8.0` | Port 3308→3306, named volume, health check via `mysqladmin ping` |
-| `server1` | `Dockerfile.server` | `depends_on: mysql-primary (healthy), mysql-backup (healthy)`, env vars for DB hosts |
+| `server1` | `Dockerfile.server` | `depends_on: mysql-primary (healthy), mysql-backup (healthy)`, env vars for DB hosts, `SERVER_HOSTNAME=server1` |
 | `server2` | `Dockerfile.server` | Same as server1, different `SERVER_HOSTNAME` |
-| `client` | `Dockerfile.client` | `depends_on: server1, server2`, `stdin_open: true`, `tty: true` for interactive CLI |
+| `client` | `Dockerfile.client` | `depends_on: server1, server2`, `stdin_open: true`, `tty: true` for interactive CLI, `command` baked in to target `server1:1099` by default |
 
 **Build process (Dockerfile.server):**
 ```dockerfile
@@ -485,12 +553,11 @@ WORKDIR /app
 COPY common ./common
 COPY server ./server
 COPY lib ./lib
-RUN javac -cp "lib/mysql-connector-j.jar" -d out \
-    common/myCabInterface.java common/Ride.java \
-    server/myCabServer.java server/DatabaseManager.java
+RUN javac -cp "lib/mysql-connector-j.jar" -d out common/*.java server/*.java
 EXPOSE 1099
 CMD ["java", "-cp", "out:lib/mysql-connector-j.jar", "server.myCabServer"]
 ```
+Both Dockerfiles compile with a wildcard (`common/*.java server/*.java` / `common/*.java client/*.java`) rather than listing files individually, so adding a new shared class (like `TimeUtil.java`) never requires touching the Dockerfile.
 
 **Startup order guarantee:** Servers use `depends_on` with `condition: service_healthy`. The MySQL health checks retry 10 times at 5-second intervals, so the server containers don't start until both databases are accepting connections and the `init.sql` schema has been loaded.
 
@@ -508,7 +575,7 @@ CREATE TABLE rides (
     ride_id                 INT AUTO_INCREMENT PRIMARY KEY,
     customer                VARCHAR(255) NOT NULL,
     pickup                  VARCHAR(255) NOT NULL,
-    destination             VARCHAR(255) NOT NULL,
+    destination              VARCHAR(255) NOT NULL,
     status                  VARCHAR(50) DEFAULT 'WAITING',   -- WAITING → ASSIGNED → DRIVER_ARRIVED
     assigned_driver         VARCHAR(255) DEFAULT NULL,
     request_time            BIGINT NOT NULL,                  -- physical clock
@@ -547,13 +614,13 @@ WAITING  ──(finalizeRide)──►  ASSIGNED  ──(arriveAtPickup, on time
 
 ### 10. Complete End-to-End Walkthrough
 
-This walkthrough exercises **every feature** in a single session. Open **three terminal windows**.
+This walkthrough exercises **every feature** in a single session, including the failback reconciliation fix. Open **three terminal windows**.
 
 #### Terminal 1 — Bring up the stack and monitor server logs
 
 ```bash
 docker compose up -d --build
-docker compose ps                  # confirm all 5 services are healthy/running
+docker compose ps                  # confirm all databases/servers are healthy/running
 docker compose logs -f server1     # keep this running to observe server output
 ```
 
@@ -563,12 +630,13 @@ docker compose logs -f server1     # keep this running to observe server output
 docker compose run --rm client
 ```
 
-**Step 1 — Observe physical clock sync (Cristian's Algorithm):**
+**Step 1 — Observe physical clock sync (Cristian's Algorithm), now human-readable:**
 ```
 ====== PHYSICAL CLOCK SYNCHRONIZATION (Cristian's Algorithm) ======
-Sample 1: RTT=12ms, estimated offset=1ms
+Sample 1 | Server time: 2026-09-21 14:32:07.481 | RTT: 12ms | Offset: 1ms
 ...
 Adopted clock offset: 1ms
+Synchronized local time: 2026-09-21 14:32:07.500
 Clock synchronized.
 ```
 
@@ -587,7 +655,7 @@ Ride ID: 1
 ```
 Enter Ride ID: 1
 Enter Driver ID: DriverA
-Synchronized acceptance timestamp (physical): 1695000001234
+Synchronized acceptance timestamp (physical): 2026-09-21 14:33:21.234
 Lamport clock (send): 4
 Lamport clock (after receive): 6
 Driver DriverA accepted Ride 1
@@ -603,7 +671,7 @@ docker compose run --rm client
 ```
 Enter Ride ID: 1
 Enter Driver ID: DriverB
-Synchronized acceptance timestamp (physical): 1695000001567
+Synchronized acceptance timestamp (physical): 2026-09-21 14:33:21.567
 Lamport clock (send): 2
 Lamport clock (after receive): 8
 Driver DriverB accepted Ride 1
@@ -621,7 +689,6 @@ Check Terminal 1 (server logs) for the physical vs. Lamport comparison output.
 
 **Step 6 — Verify data mirrored to both databases:**
 ```bash
-# In a new terminal
 docker compose exec mysql-primary mysql -u root -prootpassword \
   -e "USE mycab; SELECT * FROM rides; SELECT * FROM acceptances;"
 
@@ -647,13 +714,11 @@ Terminal 1 server logs show: `[DB] FAILOVER: primary is down, switching to BACKU
 ```
 Enter Ride ID: 1
 Enter Driver ID: DriverA
-Random arrival delay generated: 42 ms
-Simulating driver travel for 42 ms...
-Arrival timestamp (physical): 1695000003456
+Arrival timestamp (physical): 2026-09-21 14:35:10.100
 Lamport clock (send): 8
 Driver arrived on time.
 ```
-This proves the system handles writes on backup, not just reads.
+This proves the system handles writes on backup, not just reads — and gives the reconciliation step (Step 11) something real to catch up on.
 
 **Step 10 — Restore primary (Failback):**
 ```bash
@@ -666,14 +731,19 @@ Enter Ride ID: 1
 ...
 Currently serving from: PRIMARY
 ```
-Terminal 1 server logs show: `[DB] FAILBACK: primary is back online, switching back to PRIMARY.`
+Terminal 1 server logs show:
+```
+[DB] FAILBACK: primary is back online, switching back to PRIMARY.
+[DB] Reconciling PRIMARY with BACKUP after outage...
+[DB] Reconciliation complete — PRIMARY caught up with BACKUP.
+```
 
 **Step 11 — Confirm primary caught up on outage writes:**
 ```bash
 docker compose exec mysql-primary mysql -u root -prootpassword \
   -e "USE mycab; SELECT * FROM rides; SELECT * FROM arrivals;"
 ```
-The arrival record created during the outage (Step 9) should be present — proving data consistency was restored alongside connectivity.
+The arrival record created during the outage (Step 9) should be present — proving data consistency was restored alongside connectivity, not left stranded on the backup.
 
 **Step 12 — Exit (option 7):**
 ```
@@ -693,12 +763,12 @@ docker compose down -v    # also wipes database volumes
 | # | Topic | Where Implemented | Key Method / File |
 |---|-------|-------------------|-------------------|
 | 1 | Remote Method Invocation (RMI) | Client-server communication | `myCabInterface.java`, `myCabServer.java`, `myCabClient.java` |
-| 2 | Physical Clock Sync (Cristian's) | Client startup + on-demand | `myCabClient.synchronizeClock()` |
+| 2 | Physical Clock Sync (Cristian's) | Client startup + on-demand | `myCabClient.synchronizeClock()`, `TimeUtil.formatTime()` |
 | 3 | Lamport Logical Clocks | Every RMI call | `tick()`, `syncLamportWithServer()`, `updateLamportClock()`, `tickLamportClock()` |
 | 4 | Clock Ordering Comparison | Ride finalization | `myCabServer.finalizeRide()` |
 | 5 | Primary/Backup Replication | Every database write | `DatabaseManager.mirrorWrite()` |
-| 6 | Automatic Failover | On primary failure | `DatabaseManager.getActiveConnection()` |
-| 7 | Automatic Failback | While on backup, every 5s | `DatabaseManager.getActiveConnection()` |
+| 6 | Automatic Failover, Failback & Reconciliation | On primary failure / recovery | `DatabaseManager.getActiveConnection()`, `resyncFromBackup()` |
+| 7 | Client-Side Server Failover/Failback | Every RMI call | `myCabClient.callWithFailover()`, `attemptFailback()` |
 | 8 | Deadline Enforcement | Driver arrival | `myCabServer.arriveAtPickup()` |
 | 9 | Containerization (Docker) | Deployment | `Dockerfile.server`, `Dockerfile.client`, `docker-compose.yml` |
 | 10 | Shared-nothing Networking | Docker bridge network | `docker-compose.yml` — `mycab-network` |
